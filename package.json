@@ -1,0 +1,14 @@
+{
+  "name": "adiem-timing-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ADIEM Racing Live Timing - MQTT to Supabase backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.0",
+    "mqtt": "^5.14.0"
+  }
+}
