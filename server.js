@@ -85,11 +85,23 @@ async function getSessionAssignment(sessionId, transponderId, passageAt) {
   }
   if (!data) return null;
 
-  const [{ data: portalKart, error: kartError }, { data: legacyTransponder }] = await Promise.all([
-    supabase.from("karts").select("id,number,name").eq("id", data.portal_kart_id).maybeSingle(),
-    supabase.from("rt004_transponders").select("transponder_id,active").eq("transponder_id", transponderId).maybeSingle(),
-  ]);
-  if (kartError || !portalKart || !legacyTransponder?.active) return null;
+  let kartLabel = null;
+  if (data.portal_kart_id) {
+    const { data: portalKart, error: kartError } = await supabase
+      .from("karts")
+      .select("id,number,name")
+      .eq("id", data.portal_kart_id)
+      .maybeSingle();
+    if (kartError) {
+      console.error("[SUPABASE] Erro consultando kart do portal:", kartError.message);
+      return null;
+    }
+    if (!portalKart) {
+      console.warn(`[LAP] Kart ${data.portal_kart_id} não encontrado; volta será mantida sem kart.`);
+    } else {
+      kartLabel = `${portalKart.number ?? ""} ${portalKart.name ?? ""}`.trim() || `Kart ${portalKart.id.slice(0, 8)}`;
+    }
+  }
 
   return {
     id: data.id,
@@ -97,24 +109,24 @@ async function getSessionAssignment(sessionId, transponderId, passageAt) {
     rt004KartId: data.rt004_kart_id,
     portalKartId: data.portal_kart_id,
     pilotId: data.pilot_id,
-    kartLabel: `${portalKart.number ?? ""} ${portalKart.name ?? ""}`.trim() || `Kart ${portalKart.id.slice(0, 8)}`,
+    kartLabel,
   };
 }
 
 // Numeração de volta por associação: ao trocar o transponder de kart,
 // cada novo período inicia sua própria sequência.
-async function getNextLapNumber(sessionId, assignmentId) {
+async function getNextLapNumber(sessionId, transponderId) {
   const { data, error } = await supabase
     .from("rt004_laps")
     .select("lap_number")
     .eq("session_id", sessionId)
-    .eq("session_transponder_id", assignmentId)
+    .eq("transponder_id", transponderId)
     .order("lap_number", { ascending: false })
     .limit(1)
     .maybeSingle();
 
   if (error) {
-    console.error("[SUPABASE] Erro consultando última volta da associação:", error.message);
+    console.error("[SUPABASE] Erro consultando última volta do transponder:", error.message);
     return null;
   }
   return Number(data?.lap_number || 0) + 1;
@@ -133,17 +145,30 @@ async function processLap(payload, passageAt) {
     return;
   }
 
+  // O transponder precisa existir e estar ativo. Kart e piloto não são requisitos.
+  const { data: transponder, error: transponderError } = await supabase
+    .from("rt004_transponders")
+    .select("transponder_id,active")
+    .eq("transponder_id", payload.transponder_id)
+    .maybeSingle();
+
+  if (transponderError) {
+    console.error("[SUPABASE] Erro consultando transponder:", transponderError.message);
+    return;
+  }
+  if (!transponder?.active) {
+    console.warn(`[LAP] Passagem ignorada: transponder ${payload.transponder_id} inexistente ou inativo.`);
+    return;
+  }
+
+  // A ausência de associação é válida: grava a volta apenas com transponder/sessão.
   const assignment = await getSessionAssignment(
     session.id,
     payload.transponder_id,
     passageAt
   );
-  if (!assignment) {
-    console.warn(`[LAP] Passagem ignorada: transponder ${payload.transponder_id} sem associação válida na sessão ${session.id} em ${passageAt}.`);
-    return;
-  }
 
-  const nextLapNumber = await getNextLapNumber(session.id, assignment.id);
+  const nextLapNumber = await getNextLapNumber(session.id, payload.transponder_id);
   if (nextLapNumber == null) return;
 
   const endAt = new Date(passageAt);
@@ -151,12 +176,11 @@ async function processLap(payload, passageAt) {
 
   const lapRecord = {
     session_id: session.id,
-    session_transponder_id: assignment.id,
+    session_transponder_id: assignment?.id ?? null,
     lap_number: nextLapNumber,
-    transponder_id: assignment.transponderId,
-    // Kart RT004 da associação temporal; o kart do portal fica separado.
-    kart_id: assignment.rt004KartId || null,
-    portal_kart_id: assignment.portalKartId,
+    transponder_id: payload.transponder_id,
+    kart_id: assignment?.rt004KartId || null,
+    portal_kart_id: assignment?.portalKartId || null,
     start_at: startAt.toISOString(),
     end_at: endAt.toISOString(),
     lap_time_ms: Math.round(payload.lap_time_ms),
@@ -180,9 +204,10 @@ async function processLap(payload, passageAt) {
   console.log("========================================");
   console.log("[LAP] VOLTA RECEBIDA E GRAVADA");
   console.log(`[LAP] Sessão: ${session.id} (${session.test_name || "sem nome"})`);
-  console.log(`[LAP] Kart: ${assignment.kartLabel}`);
-  console.log(`[LAP] Transponder ID: ${assignment.transponderId}`);
-  console.log(`[LAP] Associação: ${assignment.id}`);
+  console.log(`[LAP] Kart: ${assignment?.kartLabel || "não associado"}`);
+  console.log(`[LAP] Piloto: ${assignment?.pilotId || "não associado"}`);
+  console.log(`[LAP] Transponder ID: ${payload.transponder_id}`);
+  console.log(`[LAP] Associação: ${assignment?.id || "nenhuma"}`);
   console.log(`[LAP] Passagem: ${passageAt}`);
   console.log(`[LAP] Número: ${data.lap_number}; tempo: ${data.lap_time_ms} ms`);
   console.log(`[LAP] Supabase ID: ${data.id}`);
@@ -197,7 +222,7 @@ console.log(`[MQTT] Broker: ${mqttUrl}`);
 console.log(`[MQTT] Topic: ${MQTT_TOPIC}`);
 console.log(`[SUPABASE] URL: ${SUPABASE_URL}`);
 console.log("[SESSION] Sessões iniciadas/encerradas pelo Live Timing.");
-console.log("[KART] Associação temporal resolvida por sessão/transponder.");
+console.log("[KART] Kart/piloto opcionais; associação temporal resolvida por sessão/transponder.");
 console.log("========================================");
 
 const mqttClient = mqtt.connect(mqttUrl, {
@@ -252,7 +277,7 @@ const server = http.createServer((req, res) => {
       service: "adiem-timing-backend",
       mqtt: mqttClient.connected,
       sessionMode: "explicit",
-      kartMapping: "session-temporal",
+      kartMapping: "optional-session-temporal",
       timestamp: nowIso(),
     }));
     return;
