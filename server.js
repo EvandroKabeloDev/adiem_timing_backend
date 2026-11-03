@@ -47,12 +47,13 @@ function validatePayload(payload) {
 }
 
 // Busca a sessão ativa correspondente ao LapWiz que enviou a passagem.
-async function getActiveSession(payload) {
+async function getActiveSession(payload, passageAt) {
   const { data, error } = await supabase
     .from("rt004_sessions")
     .select("id,test_name,started_at,event_id,device_address")
     .eq("device_address", payload.address)
-    .is("finished_at", null)
+    .lte("started_at", passageAt)
+    .or(`finished_at.is.null,finished_at.gt.${passageAt}`)
     .order("started_at", { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -64,31 +65,128 @@ async function getActiveSession(payload) {
   return data || null;
 }
 
-// Resolve o ID físico do transponder para o kart cadastrado.
-// Não atribui passagens a karts desconhecidos/inativos.
-async function getTransponderAssignment(transponderId) {
+// Resolve a associação temporal válida no instante da passagem.
+// O horário é capturado no callback MQTT antes de entrar na fila.
+async function getSessionAssignment(sessionId, transponderId, passageAt) {
   const { data, error } = await supabase
-    .from("rt004_transponders")
-    .select("transponder_id,active,kart_id,rt004_karts!inner(id,code,name,active)")
+    .from("rt004_session_transponders")
+    .select("id,transponder_id,portal_kart_id,pilot_id,started_at,ended_at")
+    .eq("session_id", sessionId)
     .eq("transponder_id", transponderId)
-    .eq("active", true)
-    .eq("rt004_karts.active", true)
+    .lte("started_at", passageAt)
+    .or(`ended_at.is.null,ended_at.gt.${passageAt}`)
+    .order("started_at", { ascending: false })
+    .limit(1)
     .maybeSingle();
 
   if (error) {
-    console.error("[SUPABASE] Erro consultando cadastro do transponder:", error.message);
+    console.error("[SUPABASE] Erro consultando associação temporal:", error.message);
     return null;
   }
-
   if (!data) return null;
 
-  const kart = data.rt004_karts;
+  const [{ data: portalKart, error: kartError }, { data: legacyTransponder }] = await Promise.all([
+    supabase.from("karts").select("id,number,name").eq("id", data.portal_kart_id).maybeSingle(),
+    supabase.from("rt004_transponders").select("transponder_id,active").eq("transponder_id", transponderId).maybeSingle(),
+  ]);
+  if (kartError || !portalKart || !legacyTransponder?.active) return null;
+
   return {
+    id: data.id,
     transponderId: data.transponder_id,
-    kartId: data.kart_id,
-    kartCode: kart.code,
-    kartName: kart.name,
+    portalKartId: data.portal_kart_id,
+    pilotId: data.pilot_id,
+    kartLabel: `${portalKart.number ?? ""} ${portalKart.name ?? ""}`.trim() || `Kart ${portalKart.id.slice(0, 8)}`,
   };
+}
+
+// Numeração de volta por associação: ao trocar o transponder de kart,
+// cada novo período inicia sua própria sequência.
+async function getNextLapNumber(sessionId, assignmentId) {
+  const { data, error } = await supabase
+    .from("rt004_laps")
+    .select("lap_number")
+    .eq("session_id", sessionId)
+    .eq("session_transponder_id", assignmentId)
+    .order("lap_number", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.error("[SUPABASE] Erro consultando última volta da associação:", error.message);
+    return null;
+  }
+  return Number(data?.lap_number || 0) + 1;
+}
+
+async function processLap(payload, passageAt) {
+  const validationError = validatePayload(payload);
+  if (validationError) {
+    console.error(`[MQTT] Payload rejeitado: ${validationError}`);
+    return;
+  }
+
+  const session = await getActiveSession(payload, passageAt);
+  if (!session) {
+    console.warn(`[LAP] Sem sessão ativa para ${payload.device} (${payload.address}).`);
+    return;
+  }
+
+  const assignment = await getSessionAssignment(
+    session.id,
+    payload.transponder_id,
+    passageAt
+  );
+  if (!assignment) {
+    console.warn(`[LAP] Passagem ignorada: transponder ${payload.transponder_id} sem associação válida na sessão ${session.id} em ${passageAt}.`);
+    return;
+  }
+
+  const nextLapNumber = await getNextLapNumber(session.id, assignment.id);
+  if (nextLapNumber == null) return;
+
+  const endAt = new Date(passageAt);
+  const startAt = new Date(endAt.getTime() - Math.round(payload.lap_time_ms));
+
+  const lapRecord = {
+    session_id: session.id,
+    session_transponder_id: assignment.id,
+    lap_number: nextLapNumber,
+    transponder_id: assignment.transponderId,
+    // kart_id legado aponta para rt004_karts; sem mapeamento por sessão,
+    // permanece NULL. O kart oficial do portal fica em portal_kart_id.
+    kart_id: null,
+    portal_kart_id: assignment.portalKartId,
+    start_at: startAt.toISOString(),
+    end_at: endAt.toISOString(),
+    lap_time_ms: Math.round(payload.lap_time_ms),
+    counter_start: typeof payload.counter_start === "number" ? payload.counter_start : null,
+    counter_end: typeof payload.counter_end === "number" ? payload.counter_end : null,
+    counter_delta: typeof payload.counter_delta === "number" ? payload.counter_delta : null,
+    source: payload.source || "esp32_mqtt",
+  };
+
+  const { data, error } = await supabase
+    .from("rt004_laps")
+    .insert(lapRecord)
+    .select()
+    .single();
+
+  if (error) {
+    console.error("[SUPABASE] Erro inserindo volta:", error.message);
+    return;
+  }
+
+  console.log("========================================");
+  console.log("[LAP] VOLTA RECEBIDA E GRAVADA");
+  console.log(`[LAP] Sessão: ${session.id} (${session.test_name || "sem nome"})`);
+  console.log(`[LAP] Kart: ${assignment.kartLabel}`);
+  console.log(`[LAP] Transponder ID: ${assignment.transponderId}`);
+  console.log(`[LAP] Associação: ${assignment.id}`);
+  console.log(`[LAP] Passagem: ${passageAt}`);
+  console.log(`[LAP] Número: ${data.lap_number}; tempo: ${data.lap_time_ms} ms`);
+  console.log(`[LAP] Supabase ID: ${data.id}`);
+  console.log("========================================");
 }
 
 // O backend serializa mensagens MQTT. A numeração é independente por
@@ -125,7 +223,7 @@ async function processLap(payload) {
     return;
   }
 
-  const session = await getActiveSession(payload);
+  const session = await getActiveSession(payload, passageAt);
   if (!session) {
     console.warn(
       `[LAP] Passagem ignorada: nenhuma sessão ativa para ${payload.device} (${payload.address}). Inicie o treino no Live Timing.`
@@ -184,7 +282,7 @@ console.log(`[MQTT] Broker: ${mqttUrl}`);
 console.log(`[MQTT] Topic: ${MQTT_TOPIC}`);
 console.log(`[SUPABASE] URL: ${SUPABASE_URL}`);
 console.log("[SESSION] Sessões iniciadas/encerradas pelo Live Timing.");
-console.log("[KART] Associação resolvida pelo cadastro rt004_transponders.");
+console.log("[KART] Associação temporal resolvida por sessão/transponder.");
 console.log("========================================");
 
 const mqttClient = mqtt.connect(mqttUrl, {
@@ -215,7 +313,8 @@ mqttClient.on("error", (error) => console.error("[MQTT] Erro:", error.message));
 let messageQueue = Promise.resolve();
 mqttClient.on("message", (topic, message) => {
   const body = message.toString();
-  console.log(`[MQTT] Mensagem recebida em ${topic}: ${body}`);
+  const passageAt = new Date().toISOString(); // instante de recebimento MQTT
+  console.log(`[MQTT] Mensagem recebida em ${topic} às ${passageAt}: ${body}`);
   messageQueue = messageQueue
     .then(async () => {
       let payload;
@@ -225,7 +324,7 @@ mqttClient.on("message", (topic, message) => {
         console.error("[MQTT] Payload rejeitado: JSON inválido.");
         return;
       }
-      await processLap(payload);
+      await processLap(payload, passageAt);
     })
     .catch((error) => console.error("[MQTT] Erro processando mensagem:", error.message));
 });
@@ -238,7 +337,7 @@ const server = http.createServer((req, res) => {
       service: "adiem-timing-backend",
       mqtt: mqttClient.connected,
       sessionMode: "explicit",
-      kartMapping: true,
+      kartMapping: "session-temporal",
       timestamp: nowIso(),
     }));
     return;
